@@ -529,6 +529,8 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
             operation: string;
             value?: string;
           }>;
+          pageStatus?: "SplitRecommended" | "SplitRequired" | null;
+          splitCursor?: string | null;
         },
         Name
       >;
@@ -590,6 +592,8 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
             value: string;
             warnAtPct?: number;
           }>;
+          pageStatus?: "SplitRecommended" | "SplitRequired" | null;
+          splitCursor?: string | null;
         },
         Name
       >;

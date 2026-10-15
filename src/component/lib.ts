@@ -1,7 +1,11 @@
 import { MINUTE, RateLimiter } from "@convex-dev/rate-limiter";
 import { ShardedCounter } from "@convex-dev/sharded-counter";
 import { paginator } from "convex-helpers/server/pagination";
-import { paginationOptsValidator } from "convex/server";
+import {
+  type PaginationResult,
+  paginationOptsValidator,
+  paginationResultValidator,
+} from "convex/server";
 import { type Infer, v } from "convex/values";
 import { components, internal } from "./_generated/api.js";
 import type { Doc } from "./_generated/dataModel.js";
@@ -2173,33 +2177,25 @@ export const paginateBuckets = query({
     dimension: v.optional(v.string()),
     paginationOpts: paginationOptsValidator,
   },
-  returns: v.object({
-    page: v.array(vBucket),
-    isDone: v.boolean(),
-    continueCursor: v.string(),
-  }),
+  returns: paginationResultValidator(vBucket),
   handler: async (
     ctx,
     { dimension, paginationOpts },
-  ): Promise<{
-    page: Doc<"buckets">[];
-    isDone: boolean;
-    continueCursor: string;
-  }> => {
+  ): Promise<PaginationResult<Doc<"buckets">>> => {
     const options = {
       cursor: paginationOpts.cursor,
       numItems: pageSize(paginationOpts.numItems, 50),
     };
-    const db = paginator(ctx.db, schema);
     const page =
       dimension === undefined
-        ? await db.query("buckets").paginate(options)
-        : await db
+        ? await ctx.db.query("buckets").paginate(options)
+        : await ctx.db
             .query("buckets")
             .withIndex("dim_value", (q) => q.eq("dimension", dimension))
             .paginate(options);
     const clock = await getSettings(ctx);
     return {
+      ...page,
       page: page.page.map((b) =>
         normalizedBucket(
           b,
@@ -2207,8 +2203,6 @@ export const paginateBuckets = query({
           clock?.reportingMonth ?? monthStamp(),
         ),
       ),
-      isDone: page.isDone,
-      continueCursor: page.continueCursor,
     };
   },
 });
@@ -2267,31 +2261,18 @@ const vAdminEvent = v.object({
 });
 export const paginateAdminEvents = query({
   args: { paginationOpts: paginationOptsValidator },
-  returns: v.object({
-    page: v.array(vAdminEvent),
-    isDone: v.boolean(),
-    continueCursor: v.string(),
-  }),
+  returns: paginationResultValidator(vAdminEvent),
   handler: async (
     ctx,
     { paginationOpts },
-  ): Promise<{
-    page: Doc<"adminEvents">[];
-    isDone: boolean;
-    continueCursor: string;
-  }> => {
-    const page = await paginator(ctx.db, schema)
+  ): Promise<PaginationResult<Doc<"adminEvents">>> => {
+    return await ctx.db
       .query("adminEvents")
       .order("desc")
       .paginate({
         cursor: paginationOpts.cursor,
         numItems: pageSize(paginationOpts.numItems, 50),
       });
-    return {
-      page: page.page,
-      isDone: page.isDone,
-      continueCursor: page.continueCursor,
-    };
   },
 });
 
@@ -2443,6 +2424,9 @@ export const setBucketLimits = mutation({
   },
 });
 
+// Uses the convex-helpers paginator rather than built-in .paginate():
+// setBucketLimits calls this from app transactions, which may already have
+// used their single built-in .paginate().
 async function attributedRequests(
   ctx: MutationCtx,
   dimension: string,
