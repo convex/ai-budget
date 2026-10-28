@@ -132,7 +132,7 @@ const noUngovernedAi: Rule.RuleModule = {
       description:
         "Disallow importing AI provider SDKs or the AI Gateway outside the budget wrapper, so all AI spend flows through @convex-dev/ai-budget.",
       recommended: true,
-      url: "https://github.com/get-convex/ai-budget#no-ungoverned-ai",
+      url: "https://github.com/convex/ai-budget#no-ungoverned-ai",
     },
     schema: [
       {
