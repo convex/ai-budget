@@ -7,7 +7,7 @@ name: Release
 #
 # Setup (one time, on npmjs.com): the package settings for
 # @convex-dev/ai-budget → "Trusted Publisher" → GitHub Actions, pointing at
-# repo get-convex/ai-budget and workflow file `release.yml`.
+# repo convex/ai-budget and workflow file `release.yml`.
 on:
   push:
     tags:
