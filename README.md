@@ -399,6 +399,19 @@ different dimensions. Each exposes:
 The identifier field is `userId` for `ai.users`, `name` for `ai.actions`, and
 `value` for `ai.tag(d)`. For example: `ai.tag("customer").setLimits(ctx, { value: "acme", … })`.
 
+### Occurrence-time attribution
+
+`begin`, `meter`, and `settle` accept optional `occurredAt` (Unix milliseconds).
+A `meter` callback may also return it. Billing uses the explicit settlement/result
+time, then the admission default, then processing time. `finishedAt` remains
+processing time, and retention keeps its existing creation-time policy.
+
+Timestamps must be safe integer milliseconds in years 0000–9999, at or before
+processing time; future timestamps are rejected before admission/finalization.
+Occurrence time selects UTC day/month history, matching live calendar counters,
+and global daily spend. Late charges still increase lifetime spend. Existing
+calls omit the new optional record fields and use `finishedAt` as before.
+
 ### Request rate limits
 
 `requestsPerMinute` uses `@convex-dev/rate-limiter` 0.4.0 with a transactional

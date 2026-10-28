@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { httpRouter } from "convex/server";
 import { expect, test, vi } from "vitest";
 
@@ -305,4 +306,27 @@ test("admin wrappers derive the audit actor from the authenticated identity", as
   expect(ctx.runMutation.mock.calls[0][1]).toMatchObject({
     actorId: "issuer|u",
   });
+});
+
+test("meter forwards occurrence-time defaults and result overrides", async () => {
+  const ctx = makeCtx();
+  const ai = new AIBudget(component);
+  await ai.meter(
+    ctx as any,
+    { model: "m", messages: [], occurredAt: 1000 },
+    async () => ({ costNanos: 42, occurredAt: 2000 }),
+  );
+  expect(ctx.runMutation.mock.calls[0][1].occurredAt).toBe(1000);
+  expect(ctx.runMutation.mock.calls[1][1].occurredAt).toBe(2000);
+});
+
+test("N2: settlement timestamp tooltip includes the admission default", () => {
+  const source = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
+  const settleArgs = source.slice(
+    source.indexOf("  async settle("),
+    source.indexOf("  ): Promise<{ costNanos: number }>"),
+  );
+  expect(settleArgs).toContain(
+    "explicit settle/result override, then begin default, then processing time",
+  );
 });
