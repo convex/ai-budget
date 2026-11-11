@@ -26,8 +26,9 @@ Include a Changeset for user-visible package changes:
 npx changeset
 ```
 
-Review the generated version PR before merging it. A bot-created PR may need
-its required `Test and lint` check run manually on `changeset-release/main`.
+Review the generated version PR before merging it. Approve its GitHub Actions
+runs if GitHub requests approval, and wait for `Test and lint` to pass. Require
+that check on `main` before merging this CI publishing setup.
 The version PR updates the package version and changelog; merging it stages the
 package from that exact commit on `main`. A maintainer then reviews the staged
 package on npm and approves with 2FA. The source tag is created only after
@@ -43,5 +44,7 @@ npm trust github @convex-dev/ai-budget --repo convex/ai-budget --file release.ym
 
 To prepare a version PR without the bot, run `npx changeset version`, review
 the version, changelog and consumed Changesets, then commit and open a PR.
-For recovery, dispatch **Release** with the version-bump commit SHA only after
-checking whether that version is already staged on npm.
+If staging failed, dispatch **Release** with the version-bump commit SHA after
+checking that the version is not staged on npm. If staging succeeded but tagging
+failed, verify the staged package and rerun the failed `tag` job in the original
+workflow run. A second staging attempt cannot reuse the reserved version.
