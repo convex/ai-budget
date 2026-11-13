@@ -27,24 +27,17 @@ npx changeset
 ```
 
 Review the generated version PR before merging it. Approve its GitHub Actions
-runs if GitHub requests approval, and wait for `Test and lint` to pass. Require
-that check on `main` before merging this CI publishing setup.
-The version PR updates the package version and changelog; merging it stages the
-package from that exact commit on `main`. A maintainer then reviews the staged
-package on npm and approves with 2FA. The source tag is created only after
-staging succeeds.
+runs if GitHub requests approval, and wait for `Test and lint` to pass. The
+version PR updates the package version and changelog. After it merges, push
+`v<version>` at the commit to release. For stable releases, that commit must be
+on `main`; it can be older than the current tip. The tag starts a workflow that
+builds and tests the commit, then stages the tested package on npm. A maintainer
+reviews the staged package and approves with 2FA.
 
-Configure npm trusted publishing for this package's `release.yml` workflow
-before the first CI release. Use the npm package's Settings → Trusted Publisher
-page, or run:
-
-```sh
-npm trust github @convex-dev/ai-budget --repo convex/ai-budget --file release.yml --allow-stage-publish
-```
+Configure npm trusted publishing for `release.yml` before the first CI release.
 
 To prepare a version PR without the bot, run `npx changeset version`, review
 the version, changelog and consumed Changesets, then commit and open a PR.
-If staging failed, dispatch **Release** with the version-bump commit SHA after
-checking that the version is not staged on npm. If staging succeeded but tagging
-failed, verify the staged package and rerun the failed `tag` job in the original
-workflow run. A second staging attempt cannot reuse the reserved version.
+If staging fails, check npm's staged packages and rerun the workflow. To retry
+with a corrected commit for the same unstaged version, move the tag and push it
+again. An already staged version cannot be staged again.
