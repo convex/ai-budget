@@ -15,7 +15,6 @@ env:
 
 jobs:
   build:
-    if: github.repository_owner == 'convex'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -36,13 +35,19 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
           package-manager-cache: false
-      - run: npm ci
       - id: release
         name: Validate the tagged release
         run: |
-          version=$(node -p "require('./package.json').version")
-          name=$(node -p "require('./package.json').name")
-          test "$GITHUB_REF_NAME" = "v$version"
+          version=$(jq -r .version package.json)
+          name=$(jq -r .name package.json)
+          test "$GITHUB_REF_NAME" = "v$version" || {
+            echo "Tag $GITHUB_REF_NAME does not match package.json version $version" >&2
+            exit 1
+          }
+          [[ "$version" != *+* ]] || {
+            echo "Build metadata is not supported: $version" >&2
+            exit 1
+          }
           if [[ "$version" == *-* ]]; then
             channel="${version#*-}"
             channel="${channel%%.*}"
@@ -63,6 +68,7 @@ jobs:
             echo "version=$version"
             echo "channel=$channel"
           } >> "$GITHUB_OUTPUT"
+      - run: npm ci
       - name: Validate release notes
         run: |
           # Compare against this checkout while reading all notes, including prerelease state.
