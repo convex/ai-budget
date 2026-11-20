@@ -928,48 +928,52 @@ export class AIBudget {
                 latencyMs: Date.now() - start,
               }));
             const reader = result.stream.getReader();
-            const tapped = new ReadableStream({
-              async pull(controller) {
-                try {
-                  const { done, value: chunk } = await reader.read();
-                  if (done) {
-                    await settle();
-                    controller.close();
-                    reader.releaseLock();
-                    return;
-                  }
-                  if (chunk?.type === "text-delta") {
-                    text = capContent(
-                      text + (chunk.delta ?? chunk.textDelta ?? ""),
-                    );
-                  }
-                  if (chunk?.type === "finish") {
-                    usage = chunk.usage;
-                    providerMetadata =
-                      chunk.providerMetadata ?? providerMetadata;
-                  }
-                  if (chunk?.type === "error")
-                    streamError = String(chunk.error);
-                  controller.enqueue(chunk);
-                  if (chunk?.type === "finish") await settle();
-                } catch (error) {
+            // Avoid prefetching a read that can settle success before cancellation.
+            const tapped = new ReadableStream(
+              {
+                async pull(controller) {
                   try {
-                    await settle(String(error));
-                  } catch (settlementError) {
-                    controller.error(settlementError);
-                    return;
+                    const { done, value: chunk } = await reader.read();
+                    if (done) {
+                      await settle();
+                      controller.close();
+                      reader.releaseLock();
+                      return;
+                    }
+                    if (chunk?.type === "text-delta") {
+                      text = capContent(
+                        text + (chunk.delta ?? chunk.textDelta ?? ""),
+                      );
+                    }
+                    if (chunk?.type === "finish") {
+                      usage = chunk.usage;
+                      providerMetadata =
+                        chunk.providerMetadata ?? providerMetadata;
+                    }
+                    if (chunk?.type === "error")
+                      streamError = String(chunk.error);
+                    controller.enqueue(chunk);
+                    if (chunk?.type === "finish") await settle();
+                  } catch (error) {
+                    try {
+                      await settle(String(error));
+                    } catch (settlementError) {
+                      controller.error(settlementError);
+                      return;
+                    }
+                    controller.error(error);
                   }
-                  controller.error(error);
-                }
+                },
+                async cancel(reason) {
+                  try {
+                    await reader.cancel(reason);
+                  } finally {
+                    await settle(`cancelled: ${String(reason)}`);
+                  }
+                },
               },
-              async cancel(reason) {
-                try {
-                  await reader.cancel(reason);
-                } finally {
-                  await settle(`cancelled: ${String(reason)}`);
-                }
-              },
-            });
+              { highWaterMark: 0 },
+            );
             return { ...result, stream: tapped };
           } catch (e) {
             await finish(requestId, {
