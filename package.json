@@ -1,11 +1,11 @@
 {
   "name": "@convex-dev/ai-budget",
   "description": "Metered, budget-governed AI spend for Convex — the AI Gateway or any provider (fal, Replicate, image/audio gen, a raw fetch) via ai.meter: cost & usage tracking, per-user/per-action/global spend/token/rate limits, request logging, re-run, and an Agent-component adapter.",
-  "repository": "github:get-convex/ai-budget",
-  "homepage": "https://github.com/get-convex/ai-budget#readme",
+  "repository": "github:convex/ai-budget",
+  "homepage": "https://github.com/convex/ai-budget#readme",
   "bugs": {
     "email": "support@convex.dev",
-    "url": "https://github.com/get-convex/ai-budget/issues"
+    "url": "https://github.com/convex/ai-budget/issues"
   },
   "version": "1.1.2",
   "license": "Apache-2.0",
@@ -33,10 +33,8 @@
     "lint": "eslint .",
     "test:watch": "vitest",
     "prepack": "npm run build",
-    "preversion": "npm ci && npm run build:clean && npm run test && npm run lint && npm run typecheck",
-    "alpha": "npm version prerelease --preid alpha && npm publish --tag alpha && git push --follow-tags",
-    "release": "npm version patch && npm publish && git push --follow-tags",
-    "version": "(npm whoami || npm login) && vim -c 'normal o' -c 'normal o## '$npm_package_version CHANGELOG.md && prettier -w CHANGELOG.md && git add CHANGELOG.md"
+    "check": "npm run test && npm run typecheck && npm run lint",
+    "test:e2e": "convex init && npm run build:codegen && convex dev --once --typecheck-components"
   },
   "files": [
     "dist",
@@ -104,6 +102,7 @@
     "typescript": "^5.7.0",
     "typescript-eslint": "^8.71.1",
     "vite": "^6.0.0",
-    "vitest": "4.1.11"
+    "vitest": "4.1.11",
+    "@changesets/cli": "3.0.3"
   }
 }
