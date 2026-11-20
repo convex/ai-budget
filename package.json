@@ -7,7 +7,7 @@
     "email": "support@convex.dev",
     "url": "https://github.com/convex/ai-budget/issues"
   },
-  "version": "1.1.2",
+  "version": "1.1.3",
   "license": "Apache-2.0",
   "type": "module",
   "keywords": [
