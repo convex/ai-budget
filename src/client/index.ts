@@ -404,6 +404,8 @@ export class AIBudget {
       reserveTtlMs?: number;
       rerunOf?: string;
       idempotencyKey?: string;
+      /** Optional billing time (Unix milliseconds); settle can override it. */
+      occurredAt?: number;
     },
   ): Promise<
     | {
@@ -432,6 +434,7 @@ export class AIBudget {
       estimatedTokens: opts.estimatedTokens,
       reserveTtlMs: opts.reserveTtlMs,
       idempotencyKey: opts.idempotencyKey,
+      occurredAt: opts.occurredAt,
       rerunOf: opts.rerunOf as any,
     });
     if (started.allowed) {
@@ -468,6 +471,8 @@ export class AIBudget {
     ctx: MutationCtx | ActionCtx,
     args: {
       requestId: string;
+      /** Billing time: explicit settle/result override, then begin default, then processing time. */
+      occurredAt?: number;
       responseText?: string;
       error?: string;
       usage?: any;
@@ -539,6 +544,8 @@ export class AIBudget {
       estimatedCostNanos?: number;
       estimatedTokens?: number;
       idempotencyKey?: string;
+      /** Optional billing time (Unix milliseconds); settle can override it. */
+      occurredAt?: number;
     },
     run: (tracking: { requestId: string; idempotencyKey?: string }) => Promise<{
       text?: string;
@@ -550,6 +557,8 @@ export class AIBudget {
       cachedWrite1hTokens?: number;
       serverToolUses?: Record<string, number>;
       costNanos?: number;
+      /** Override the billing time for this result. */
+      occurredAt?: number;
     }>,
   ): Promise<ChatResult> {
     const started = await this.begin(ctx, opts);
@@ -596,6 +605,7 @@ export class AIBudget {
       cachedWrite1hTokens: out.cachedWrite1hTokens,
       serverToolUses: out.serverToolUses,
       costNanos: out.costNanos,
+      occurredAt: out.occurredAt,
       latencyMs: Date.now() - start,
     });
     // Re-derive the recorded usage for the return value.

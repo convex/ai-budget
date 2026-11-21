@@ -31,6 +31,7 @@ export default defineSchema({
     ),
     tokens: v.number(),
     finishedAt: v.number(),
+    occurredAt: v.optional(v.number()),
     // A durable, PII-light billing ledger: the row stores NO prompt/response
     // content and NO user identifier field. `bucketIds` are opaque handles —
     // resolvable to a (dimension, value) only by joining the `buckets` table in
@@ -230,6 +231,8 @@ export default defineSchema({
     expiresAt: v.optional(v.number()),
     expiredAt: v.optional(v.number()),
     finishedAt: v.optional(v.number()),
+    // Billing time is separate from processing/retention time.
+    occurredAt: v.optional(v.number()),
     estimatedNanos: v.optional(v.number()),
     estimatedTokens: v.optional(v.number()),
     // true when the model had no known/override price and was charged the

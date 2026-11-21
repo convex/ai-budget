@@ -82,6 +82,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           costNanos?: number;
           error?: string;
           latencyMs?: number;
+          occurredAt?: number;
           promptTokens?: number;
           requestId: string;
           responseText?: string;
@@ -102,6 +103,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           costSource?:
             "authoritative" | "token_estimate" | "reservation_estimate";
           finishedAt: number;
+          occurredAt?: number;
           requestId: string;
           tokens: number;
         } | null,
@@ -221,6 +223,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           latencyMs?: number;
           messages: Array<{ content: string; role: string }>;
           model: string;
+          occurredAt?: number;
           overBudget?: boolean;
           priceSnapshot?: {
             cacheWrite: number;
@@ -280,6 +283,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
             latencyMs?: number;
             messages: Array<{ content: string; role: string }>;
             model: string;
+            occurredAt?: number;
             overBudget?: boolean;
             priceSnapshot?: {
               cacheWrite: number;
@@ -332,6 +336,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
             latencyMs?: number;
             messages: Array<{ content: string; role: string }>;
             model: string;
+            occurredAt?: number;
             overBudget?: boolean;
             priceSnapshot?: {
               cacheWrite: number;
@@ -471,6 +476,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           latencyMs?: number;
           messages: Array<{ content: string; role: string }>;
           model: string;
+          occurredAt?: number;
           overBudget?: boolean;
           priceSnapshot?: {
             cacheWrite: number;
@@ -702,6 +708,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           legacyUserId?: string;
           messages: Array<{ content: string; role: string }>;
           model: string;
+          occurredAt?: number;
           rerunOf?: string;
           reserveTtlMs?: number;
           tags?: Array<{ dimension: string; value: string }>;

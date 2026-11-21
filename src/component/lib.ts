@@ -43,6 +43,18 @@ function assertAmount(
   if (!signed && n < 0)
     throw new Error(`${name} must be nonnegative (got ${n})`);
 }
+function assertTimestamp(n: number | undefined, name: string) {
+  assertAmount(n, name, { signed: true });
+  if (n !== undefined && (n < -62167219200000 || n > 253402300799999))
+    throw new Error(
+      `${name} must be Unix milliseconds in years 0000 through 9999`,
+    );
+}
+function assertOccurrenceTimestamp(n: number | undefined) {
+  assertTimestamp(n, "occurredAt");
+  if (n !== undefined && n > Date.now())
+    throw new Error("occurredAt cannot be in the future");
+}
 function assertFraction(n: number | null | undefined, name: string) {
   if (n == null) return;
   if (!Number.isFinite(n) || n < 0 || n > 1) {
@@ -866,6 +878,7 @@ const vStartResult = v.union(
 
 export const startRequest = mutation({
   args: {
+    occurredAt: v.optional(v.number()),
     idempotencyKey: v.optional(v.string()),
     userId: v.string(),
     // Host-derived old subject key: prevent an identity upgrade bypassing its budget.
@@ -908,6 +921,7 @@ export const startRequest = mutation({
     }
     assertKey(args.model, "model");
     if (args.actionName !== undefined) assertKey(args.actionName, "actionName");
+    assertOccurrenceTimestamp(args.occurredAt);
     assertAmount(args.reserveTtlMs, "reserveTtlMs");
     if ((args.reserveTtlMs ?? 0) > 30 * 24 * 60 * 60 * 1000) {
       throw new Error("reserveTtlMs cannot exceed 30 days");
@@ -935,6 +949,9 @@ export const startRequest = mutation({
           estimatedTokens: args.estimatedTokens ?? null,
           reserveTtlMs: args.reserveTtlMs ?? null,
           rerunOf: args.rerunOf ?? null,
+          ...(args.occurredAt !== undefined
+            ? { occurredAt: args.occurredAt }
+            : {}),
         }),
       );
       fingerprint = Array.from(
@@ -1288,6 +1305,7 @@ export const startRequest = mutation({
       status: "pending",
       expiresAt:
         Date.now() + Math.max(STALE_PENDING_MS, args.reserveTtlMs ?? 0),
+      occurredAt: args.occurredAt,
       heldBucketIds: buckets.filter(needsReserve).map((b) => b._id),
       attributedBuckets: buckets.map((b) => ({
         dimension: b.dimension,
@@ -1335,6 +1353,7 @@ export const startRequest = mutation({
 
 export const finishRequest = mutation({
   args: {
+    occurredAt: v.optional(v.number()),
     requestId: v.id("requests"),
     responseText: v.optional(v.string()),
     error: v.optional(v.string()),
@@ -1398,6 +1417,7 @@ export const finishRequest = mutation({
       }
     }
     assertAmount(args.latencyMs, "latencyMs");
+    assertOccurrenceTimestamp(args.occurredAt);
     // Prefer an authoritative gateway cost when supplied (it already includes
     // tool fees); otherwise price from tokens — discounting the cached
     // (prompt-cache-read) slice — plus any server-tool per-call fees. Require it
@@ -1459,6 +1479,7 @@ export const finishRequest = mutation({
       reservationExpired: false,
       expiresAt: undefined,
       finishedAt: Date.now(),
+      occurredAt: args.occurredAt ?? request.occurredAt,
       messages: storeContent && !request.privacyErased ? request.messages : [],
       responseText:
         storeContent && !request.privacyErased
@@ -1553,7 +1574,9 @@ async function foldOne(ctx: MutationCtx, req: Doc<"requests"> | null) {
   await releaseReservation(ctx, req);
   const actual = req.costNanos ?? 0;
   const tokens = (req.promptTokens ?? 0) + (req.completionTokens ?? 0);
-  const timestamp = new Date(req.finishedAt ?? Date.now()).toISOString();
+  const timestamp = new Date(
+    req.occurredAt ?? req.finishedAt ?? Date.now(),
+  ).toISOString();
   const day = timestamp.slice(0, 10);
   const month = timestamp.slice(0, 7);
   for (const t of requestBuckets(req.userId, req.actionName, req.tags)) {
@@ -1638,6 +1661,7 @@ async function foldOne(ctx: MutationCtx, req: Doc<"requests"> | null) {
     costSource: req.costSource,
     tokens,
     finishedAt: req.finishedAt ?? Date.now(),
+    ...(req.occurredAt !== undefined ? { occurredAt: req.occurredAt } : {}),
     bucketIds: req.attributedBuckets?.map((t) => t.bucketId) ?? [],
   });
   // Reporting is independent of whether enforcement is configured.
