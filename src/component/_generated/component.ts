@@ -126,6 +126,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           dayStamp: string;
           dimension: string;
           enforcement?: "hard" | "soft";
+          foldedThroughTs?: bigint;
           lifetimeBumpNanos?: number;
           lifetimeSpendLimitNanos?: number;
           lifetimeTokenLimit?: number;
@@ -395,6 +396,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           dayStamp: string;
           dimension: string;
           enforcement?: "hard" | "soft";
+          foldedThroughTs?: bigint;
           lifetimeBumpNanos?: number;
           lifetimeSpendLimitNanos?: number;
           lifetimeTokenLimit?: number;
@@ -566,6 +568,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
             dayStamp: string;
             dimension: string;
             enforcement?: "hard" | "soft";
+            foldedThroughTs?: bigint;
             lifetimeBumpNanos?: number;
             lifetimeSpendLimitNanos?: number;
             lifetimeTokenLimit?: number;
@@ -631,6 +634,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "internal",
         {
           actorId?: string;
+          admission?: "snapshot" | "exact";
           allowUnpricedModels?: boolean;
           requireExplicitReservations?: boolean;
           storeContent?: boolean;

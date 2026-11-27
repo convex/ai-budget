@@ -1238,6 +1238,11 @@ export class AIBudget {
        *   under hard enforcement (default true — charge the conservative fallback).
        * - `storeContent: false` stops persisting prompt/response content on
        *   request rows (default true).
+       * - `admission: "exact"` makes concurrent admissions for one bucket see
+       *   each other's holds, at the cost of conflicting (and being retried by
+       *   Convex) when they race. The default, `"snapshot"`, never conflicts;
+       *   a cap can then be passed by the estimates of calls admitted at the
+       *   same moment (README, "Concurrent calls").
        */
       setPolicy: (
         ctx: MutationCtx | ActionCtx,
@@ -1246,6 +1251,7 @@ export class AIBudget {
           storeContent?: boolean;
           storeRawErrors?: boolean;
           requireExplicitReservations?: boolean;
+          admission?: "snapshot" | "exact";
         },
       ) => this.adminMutation(ctx, c.lib.setDeploymentPolicy, args),
     };

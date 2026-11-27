@@ -130,6 +130,10 @@ export default defineSchema({
     reservedMonthTokens: v.optional(v.number()),
     reservedTotalTokens: v.optional(v.number()),
     pendingCount: v.optional(v.number()),
+    // The accounting fields above include every `ledger` entry for this bucket
+    // with commitTs <= foldedThroughTs (absent: none). Entries after it are
+    // added on read (admission, getBucket). Only the ledger folder writes it.
+    foldedThroughTs: v.optional(v.int64()),
   })
     // The compound dim_value index also serves dimension-only (prefix) queries,
     // so no separate `dimension` index is needed — one fewer index write on the
@@ -169,6 +173,40 @@ export default defineSchema({
     drainToRow: v.boolean(),
     bucketId: v.optional(v.id("buckets")),
   }).index("dim_value", ["dimension", "value"]),
+
+  // Append-only accounting for capped and rate-limited buckets. Admission
+  // inserts a reservation (or, for a rate-only bucket, an admission), and
+  // settling a request inserts its release and its spend, instead of patching
+  // the bucket row. Concurrent calls for one user then never write the same
+  // document. Admission reads the entries after the bucket's foldedThroughTs up
+  // to its own snapshot timestamp, so an entry a racing call inserts lands
+  // above the range it read and doesn't conflict. The ledger folder applies
+  // entries to the bucket row in commitTs order, later, as the only writer.
+  ledger: defineTable({
+    bucketId: v.id("buckets"),
+    ts: v.commitTs(),
+    kind: v.union(
+      v.literal("admit"),
+      v.literal("reserve"),
+      v.literal("release"),
+      v.literal("spend"),
+    ),
+    // The UTC day and month the entry counts in: the reservation's for
+    // reserve and release, the finish time's for spend.
+    day: v.string(),
+    month: v.string(),
+    nanos: v.number(),
+    tokens: v.number(),
+    // Date.now() when inserted: the request-rate window is wall-clock time.
+    at: v.number(),
+  })
+    .index("bucket_ts", ["bucketId", "ts"])
+    .index("ts", ["ts"]),
+  // How far the ledger folder has applied entries, across all buckets.
+  ledgerState: defineTable({
+    key: v.literal("singleton"),
+    foldedThroughTs: v.int64(),
+  }).index("key", ["key"]),
 
   // Reverse index for filtering the request log by an arbitrary tag dimension
   // (user/action are already indexed on `requests`). One row per extra tag per
@@ -358,5 +396,11 @@ export default defineSchema({
     // rather than short retention.
     storeContent: v.optional(v.boolean()),
     storeRawErrors: v.optional(v.boolean()),
+    // "snapshot" (default): admission reads the ledger up to its snapshot, so
+    // concurrent calls never conflict, and a cap can be passed by the estimates
+    // of calls admitted at the same moment. "exact": admission also reads past
+    // its snapshot, so a racing admission conflicts and Convex retries it; caps
+    // hold to the estimate, and a user's concurrent calls serialize.
+    admission: v.optional(v.union(v.literal("snapshot"), v.literal("exact"))),
   }).index("key", ["key"]),
 });
