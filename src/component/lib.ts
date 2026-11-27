@@ -7,7 +7,7 @@ import {
 } from "convex/server";
 import { type Infer, v } from "convex/values";
 import { components, internal } from "./_generated/api.js";
-import type { Doc } from "./_generated/dataModel.js";
+import type { Doc, Id } from "./_generated/dataModel.js";
 import {
   internalMutation,
   mutation,
@@ -258,9 +258,9 @@ const DEFAULT_SERVER_TOOL_PRICES: Record<string, number> = {
   web_search: 10_000_000, // $0.01 per search
 };
 
-// Pessimistic assumed output length when reserving budget up front. This makes
-// concurrent admission atomic against the estimate; a response that exceeds the
-// estimate can still settle above the cap by the estimation delta.
+// Pessimistic assumed output length when reserving budget up front. A response
+// that exceeds the estimate can still settle above the cap by the estimation
+// delta.
 const ESTIMATED_OUTPUT_TOKENS = 800;
 // Expiry releases a hold without declaring final usage. A late provider
 // completion can still record its authoritative charge exactly once.
@@ -798,7 +798,8 @@ async function admissionBucket(
     await syncPolicy(ctx, bucket);
     return bucket;
   }
-  // Only capped buckets need an atomic read of their accounting state.
+  // Only capped buckets need their accounting state (replayed with the ledger
+  // in startRequest).
   if (needsReserve(policy))
     return (await ctx.db.get("buckets", policy.bucketId))!;
   return {
@@ -812,8 +813,8 @@ async function admissionBucket(
   };
 }
 
-// Does this bucket have a cap (so its row must be updated live at settle for
-// enforcement)? Reads the cold policy table, not the hot counter row. Uncapped
+// Does this bucket have a cap (so settle records its spend in the ledger, which
+// admission reads)? Reads the cold policy table, not the bucket row. Uncapped
 // buckets are folded into their row lazily by the reconciler's rollupPhase.
 async function bucketIsCapped(
   ctx: MutationCtx,
@@ -827,6 +828,165 @@ async function bucketIsCapped(
     )
     .unique();
   return policy ? needsReserve(policy) : false;
+}
+
+// ---------------------------------------------------------------------------
+// The ledger (schema.ts, `ledger`). A capped bucket's accounting used to be
+// patched in place by admission and settle, so every concurrent call for one
+// user read and wrote the same row and lost OCC retries to its siblings (a
+// voice turn makes ~8 metered calls at once). Each change is now an entry; the
+// row holds the entries through `foldedThroughTs`, and readers replay the rest.
+
+type LedgerEntry = Pick<
+  Doc<"ledger">,
+  "kind" | "day" | "month" | "nanos" | "tokens"
+>;
+
+// The request-rate window, by each entry's `at`. Admission reads entries from
+// RATE_READ_NS before its snapshot: an entry inserted within the last minute
+// committed within it too, and the snapshot is never ahead of now, so that
+// range holds every entry in the window (the margin covers clock skew between
+// Date.now() and the commit clock).
+const RATE_WINDOW_MS = 60_000;
+const RATE_READ_NS = 70_000_000_000n;
+// Entries are deleted once folded and older than this (twice the rate window,
+// so no admission's read range reaches them).
+const LEDGER_KEEP_NS = 2n * RATE_READ_NS;
+// requestsPerMinute up to this is counted from the ledger (reading up to that
+// many entries per admission). Above it, the rate limiter component counts, as
+// before: right for a hot shared dimension, not for one user's burst.
+const LEDGER_RATE_MAX = 1000;
+// Most entries one admission or read will replay. More than this unfolded
+// means the folder is behind; admission then refuses as a momentary limit.
+const LEDGER_READ_MAX = 4000;
+const LEDGER_FOLD_BATCH = 500;
+
+const usesLedgerRate = (b: { requestsPerMinute?: number }) =>
+  b.requestsPerMinute !== undefined && b.requestsPerMinute <= LEDGER_RATE_MAX;
+
+// The patch one entry makes to a bucket's accounting: the same arithmetic the
+// row used to get in place at admission (reserve), at release, and at settle
+// (spend). Replaying entries in commitTs order reproduces those writes.
+function entryPatch(b: Doc<"buckets">, e: LedgerEntry) {
+  const { day, month, nanos, tokens } = e;
+  if (e.kind === "reserve") {
+    const sameDay = b.dayStamp === day;
+    const sameMonth = b.monthStamp === month;
+    return {
+      ...windowResets(b, day, month),
+      dayStamp: day,
+      monthStamp: month,
+      spendTodayNanos: sameDay ? b.spendTodayNanos : 0,
+      tokensToday: sameDay ? (b.tokensToday ?? 0) : 0,
+      spendThisMonthNanos: sameMonth ? (b.spendThisMonthNanos ?? 0) : 0,
+      tokensThisMonth: sameMonth ? (b.tokensThisMonth ?? 0) : 0,
+      reservedTodayNanos: (sameDay ? fin(b.reservedTodayNanos) : 0) + nanos,
+      reservedMonthNanos: (sameMonth ? fin(b.reservedMonthNanos) : 0) + nanos,
+      reservedTotalNanos: fin(b.reservedTotalNanos) + nanos,
+      reservedTodayTokens: (sameDay ? fin(b.reservedTodayTokens) : 0) + tokens,
+      reservedMonthTokens:
+        (sameMonth ? fin(b.reservedMonthTokens) : 0) + tokens,
+      reservedTotalTokens: fin(b.reservedTotalTokens) + tokens,
+      pendingCount: fin(b.pendingCount) + 1,
+    };
+  }
+  if (e.kind === "release") {
+    // Only from the reservation's own windows: a previous day's completion
+    // must not debit today's holds.
+    return {
+      reservedTodayNanos: Math.max(
+        0,
+        fin(b.reservedTodayNanos) - (b.dayStamp === day ? nanos : 0),
+      ),
+      reservedMonthNanos: Math.max(
+        0,
+        fin(b.reservedMonthNanos) - (b.monthStamp === month ? nanos : 0),
+      ),
+      reservedTotalNanos: Math.max(0, fin(b.reservedTotalNanos) - nanos),
+      reservedTodayTokens: Math.max(
+        0,
+        fin(b.reservedTodayTokens) - (b.dayStamp === day ? tokens : 0),
+      ),
+      reservedMonthTokens: Math.max(
+        0,
+        fin(b.reservedMonthTokens) - (b.monthStamp === month ? tokens : 0),
+      ),
+      reservedTotalTokens: Math.max(0, fin(b.reservedTotalTokens) - tokens),
+      pendingCount: Math.max(0, fin(b.pendingCount) - 1),
+    };
+  }
+  if (e.kind === "spend") {
+    const targetDay = b.dayStamp > day ? b.dayStamp : day;
+    const targetMonth = (b.monthStamp ?? "") > month ? b.monthStamp! : month;
+    return {
+      totalSpendNanos: b.totalSpendNanos + nanos,
+      totalRequests: b.totalRequests + 1,
+      totalTokens: b.totalTokens + tokens,
+      ...windowResets(b, targetDay, targetMonth),
+      dayStamp: targetDay,
+      monthStamp: targetMonth,
+      spendTodayNanos:
+        (b.dayStamp === targetDay ? b.spendTodayNanos : 0) +
+        (day === targetDay ? nanos : 0),
+      tokensToday:
+        (b.dayStamp === targetDay ? (b.tokensToday ?? 0) : 0) +
+        (day === targetDay ? tokens : 0),
+      spendThisMonthNanos:
+        (b.monthStamp === targetMonth ? (b.spendThisMonthNanos ?? 0) : 0) +
+        (month === targetMonth ? nanos : 0),
+      tokensThisMonth:
+        (b.monthStamp === targetMonth ? (b.tokensThisMonth ?? 0) : 0) +
+        (month === targetMonth ? tokens : 0),
+      ...(b.dayStamp !== targetDay
+        ? { reservedTodayNanos: 0, reservedTodayTokens: 0 }
+        : {}),
+      ...(b.monthStamp !== targetMonth
+        ? { reservedMonthNanos: 0, reservedMonthTokens: 0 }
+        : {}),
+    };
+  }
+  return {}; // "admit": counts toward the request rate only
+}
+
+// The bucket with `entries` applied, in order. Saturates rather than throws on
+// overflow (see checkedAccounting), so one bad entry can't wedge the folder.
+function replay(b: Doc<"buckets">, entries: LedgerEntry[]): Doc<"buckets"> {
+  let cur = b;
+  for (const e of entries) {
+    cur = {
+      ...cur,
+      ...checkedAccounting(entryPatch(cur, e), { saturate: true }),
+    };
+  }
+  return cur;
+}
+
+async function addEntry(
+  ctx: MutationCtx,
+  bucketId: Id<"buckets">,
+  entry: LedgerEntry,
+) {
+  await ctx.db.insert("ledger", {
+    bucketId,
+    ts: ctx.db.vars.commitTs,
+    at: Date.now(),
+    ...entry,
+  });
+}
+
+// A bucket's accounting with its unfolded entries applied, for a read that
+// isn't admission (admission bounds the read by its snapshot; see startRequest).
+async function withLedger<B extends Doc<"buckets">>(
+  ctx: QueryCtx,
+  b: B,
+): Promise<B> {
+  const entries = await ctx.db
+    .query("ledger")
+    .withIndex("bucket_ts", (q) =>
+      q.eq("bucketId", b._id).gt("ts", b.foldedThroughTs ?? 0n),
+    )
+    .take(LEDGER_READ_MAX);
+  return entries.length ? (replay(b, entries) as B) : b;
 }
 
 async function getSettings(ctx: MutationCtx | QueryCtx) {
@@ -1088,6 +1248,54 @@ export const startRequest = mutation({
       buckets.push(await admissionBucket(ctx, t.dimension, t.value));
     }
 
+    // Each bucket as of this transaction's snapshot: its row plus the ledger
+    // entries after its foldedThroughTs, and its admissions in the last minute.
+    // The read stops at the snapshot. An entry a concurrent admission inserts
+    // commits later, at a higher commitTs, so it's outside the range read here
+    // and the two don't conflict. Neither sees the other's hold, so a cap can be
+    // passed by the estimates of calls admitted at the same moment (README,
+    // "Concurrent calls"). With `admission: "exact"` the read runs past the
+    // snapshot: a racing insert then conflicts and Convex retries this call.
+    const snapshotTs = ctx.meta.getSnapshotTs();
+    const exact = settings?.admission === "exact";
+    const recentAdmits = new Map<string, number>();
+    for (let i = 0; i < buckets.length; i++) {
+      const b = buckets[i];
+      const accounted = needsReserve(b);
+      if (!accounted && !usesLedgerRate(b)) continue;
+      const rateFrom = snapshotTs - RATE_READ_NS;
+      const folded = accounted ? (b.foldedThroughTs ?? 0n) : rateFrom;
+      const from = folded < rateFrom ? folded : rateFrom;
+      const entries = await ctx.db
+        .query("ledger")
+        .withIndex("bucket_ts", (q) => {
+          const after = q.eq("bucketId", b._id).gt("ts", from);
+          return exact ? after : after.lte("ts", snapshotTs);
+        })
+        .take(LEDGER_READ_MAX);
+      if (entries.length === LEDGER_READ_MAX) {
+        // The folder is behind; this clears once it catches up.
+        return reject(
+          b.dimension === USER_DIM ? "rate_limit" : `${b.dimension}_rate_limit`,
+          `Too many unsettled requests to account for ${b.dimension} "${b.value}"; retry shortly`,
+          false,
+        );
+      }
+      if (accounted)
+        buckets[i] = replay(
+          b,
+          entries.filter((e) => (e.ts as bigint) > folded),
+        );
+      recentAdmits.set(
+        b._id,
+        entries.filter(
+          (e) =>
+            e.at > Date.now() - RATE_WINDOW_MS &&
+            (e.kind === "admit" || e.kind === "reserve"),
+        ).length,
+      );
+    }
+
     // A hard block on ANY bucket rejects the request. The user dimension's block
     // isn't persisted (retried in a loop); config-level blocks on other
     // dimensions are rarer, so they persist for the audit log.
@@ -1118,16 +1326,24 @@ export const startRequest = mutation({
       }
     }
 
-    // Check all rates before consuming any. These transactional reads remain
-    // in admission's read set, so concurrent requests cannot spend the same
-    // capacity. Budget rejections below leave every rate balance untouched.
+    // Check all rates before consuming any: the ledger's count of the last
+    // minute's admissions (read above), or the rate limiter's balance for
+    // rates above LEDGER_RATE_MAX. A rejection below records no admission and
+    // consumes no rate limiter balance.
     for (const b of buckets) {
       const limit = b.requestsPerMinute;
       if (limit === undefined) continue;
       const ok =
         limit > 0 &&
-        (await requestRateLimiter.check(ctx, "requests", requestRateOptions(b)))
-          .ok;
+        (usesLedgerRate(b)
+          ? (recentAdmits.get(b._id) ?? 0) < limit
+          : (
+              await requestRateLimiter.check(
+                ctx,
+                "requests",
+                requestRateOptions(b),
+              )
+            ).ok);
       if (!ok) {
         const code =
           b.dimension === USER_DIM ? "rate_limit" : `${b.dimension}_rate_limit`;
@@ -1140,11 +1356,11 @@ export const startRequest = mutation({
     }
 
     // Committed + already-reserved in-flight usage + this estimate must fit
-    // under EACH bucket's cap. Decided and reserved in one transaction, so
-    // Convex's serializable isolation makes concurrent admission atomic across
-    // every capped bucket. Final usage can exceed the estimate; settlement then
-    // records the actual amount. Soft enforcement turns a violation into a
-    // warning instead of a block.
+    // under EACH bucket's cap, as of this transaction's snapshot (above): a
+    // call admitted at the same moment isn't counted, unless admission is
+    // "exact". Final usage can exceed the estimate; settlement then records the
+    // actual amount. Soft enforcement turns a violation into a warning instead
+    // of a block.
     for (const b of buckets) {
       const sameDay = b.dayStamp === today;
       const sameMonth = b.monthStamp === month;
@@ -1194,8 +1410,8 @@ export const startRequest = mutation({
     // Deployment-wide ("global") spend cap — the same estimated-usage admission
     // rule as the per-bucket caps above: a request is admitted only if
     // committed + reserved + estimate <= cap. The ONE difference is the holder:
-    // per-bucket caps reserve on a single row (an atomic check-and-reserve),
-    // while the global holder is a sharded counter for
+    // per-bucket caps reserve in the ledger, which admission reads, while the
+    // global holder is a sharded counter for
     // throughput. The sum is transactional, but excludes unsettled usage and
     // has no cross-request reservation, so a hard global cap can overshoot. That's the deliberate consistency/throughput
     // trade for a deployment-wide killswitch; it's the only approximate scope.
@@ -1223,8 +1439,9 @@ export const startRequest = mutation({
       notices.push("Deployment approaching its global spend limit");
     }
 
-    // Consume only after every admission check succeeds, in the same
-    // transaction as the reservations and request insert. `throws: true` is
+    // Rates above LEDGER_RATE_MAX use the rate limiter component. Consume only
+    // after every admission check succeeds, in the same transaction as the
+    // reservations and request insert. `throws: true` is
     // deliberate, not a rough edge: we already `.check`ed every bucket above in
     // this same serializable transaction, so a `.limit` here cannot fail on a
     // bucket that passed check — and if it somehow did (or a later bucket did),
@@ -1233,7 +1450,7 @@ export const startRequest = mutation({
     // return would COMMIT the partial consumption and leak rate capacity, so keep
     // the throw.
     for (const b of buckets) {
-      if (b.requestsPerMinute !== undefined) {
+      if (b.requestsPerMinute !== undefined && !usesLedgerRate(b)) {
         await requestRateLimiter.limit(ctx, "requests", {
           ...requestRateOptions(b),
           throws: true,
@@ -1241,39 +1458,27 @@ export const startRequest = mutation({
       }
     }
 
-    // Passed — reserve, but ONLY on buckets that actually have a cap. Writing an
-    // uncapped bucket's row here would serialize every request that shares it
-    // (e.g. all callers of one action, or every request in one env); with no cap
-    // there's no reserved amount to consult. Totals are still accrued later,
-    // asynchronously, in foldOne — for every bucket, capped or not.
+    // Passed: reserve on buckets with a cap, as a ledger entry (the bucket row
+    // is never written here; see the read above). A rate-only bucket gets an
+    // admission entry, which its request rate counts. Uncapped buckets get
+    // nothing: their totals accrue asynchronously, in foldOne.
     for (const b of buckets) {
-      if (!needsReserve(b)) continue;
-      const sameDay = b.dayStamp === today;
-      const sameMonth = b.monthStamp === month;
-      await ctx.db.patch(
-        "buckets",
-        b._id,
-        checkedAccounting({
-          ...windowResets(b, today, month),
-          dayStamp: today,
-          monthStamp: month,
-          spendTodayNanos: sameDay ? b.spendTodayNanos : 0,
-          tokensToday: sameDay ? (b.tokensToday ?? 0) : 0,
-          spendThisMonthNanos: sameMonth ? (b.spendThisMonthNanos ?? 0) : 0,
-          tokensThisMonth: sameMonth ? (b.tokensThisMonth ?? 0) : 0,
-          reservedTodayNanos:
-            (sameDay ? (b.reservedTodayNanos ?? 0) : 0) + est.cost,
-          reservedMonthNanos:
-            (sameMonth ? (b.reservedMonthNanos ?? 0) : 0) + est.cost,
-          reservedTotalNanos: (b.reservedTotalNanos ?? 0) + est.cost,
-          reservedTodayTokens:
-            (sameDay ? (b.reservedTodayTokens ?? 0) : 0) + est.tokens,
-          reservedMonthTokens:
-            (sameMonth ? (b.reservedMonthTokens ?? 0) : 0) + est.tokens,
-          reservedTotalTokens: (b.reservedTotalTokens ?? 0) + est.tokens,
-          pendingCount: (b.pendingCount ?? 0) + 1,
-        }),
-      );
+      if (needsReserve(b))
+        await addEntry(ctx, b._id, {
+          kind: "reserve",
+          day: today,
+          month,
+          nanos: est.cost,
+          tokens: est.tokens,
+        });
+      else if (usesLedgerRate(b))
+        await addEntry(ctx, b._id, {
+          kind: "admit",
+          day: today,
+          month,
+          nanos: 0,
+          tokens: 0,
+        });
     }
     const requestId = await ctx.db.insert("requests", {
       userId: args.userId,
@@ -1513,31 +1718,15 @@ async function releaseReservation(ctx: MutationCtx, req: Doc<"requests">) {
         : !needsReserve(b))
     )
       continue;
-    await ctx.db.patch(
-      "buckets",
-      b._id,
-      checkedAccounting({
-        reservedTodayNanos: Math.max(
-          0,
-          fin(b.reservedTodayNanos) - (b.dayStamp === day ? cost : 0),
-        ),
-        reservedMonthNanos: Math.max(
-          0,
-          fin(b.reservedMonthNanos) - (b.monthStamp === month ? cost : 0),
-        ),
-        reservedTotalNanos: Math.max(0, fin(b.reservedTotalNanos) - cost),
-        reservedTodayTokens: Math.max(
-          0,
-          fin(b.reservedTodayTokens) - (b.dayStamp === day ? tokens : 0),
-        ),
-        reservedMonthTokens: Math.max(
-          0,
-          fin(b.reservedMonthTokens) - (b.monthStamp === month ? tokens : 0),
-        ),
-        reservedTotalTokens: Math.max(0, fin(b.reservedTotalTokens) - tokens),
-        pendingCount: Math.max(0, fin(b.pendingCount) - 1),
-      }),
-    );
+    // A hold placed before the ledger existed is in the row's counters; this
+    // entry takes it out of them when folded, the same as a ledger hold.
+    await addEntry(ctx, b._id, {
+      kind: "release",
+      day,
+      month,
+      nanos: cost,
+      tokens,
+    });
   }
   await ctx.db.patch(
     "requests",
@@ -1569,55 +1758,20 @@ async function foldOne(ctx: MutationCtx, req: Doc<"requests"> | null) {
         : deletion && req._creationTime <= deletion._creationTime
     )
       continue;
-    // Capped buckets need their row updated LIVE so the next admission sees the
-    // spend (enforcement can't wait for the async rollup). They're per-user /
-    // low-concurrency, so the row isn't a hot contention point. Uncapped buckets
-    // (the shared action/tag rows) get NO write here — only an append-only delta
-    // the reconciler drains — so a hot shared dimension never serializes settles.
+    // A capped bucket's spend goes in the ledger, which admission replays, so
+    // the next admission sees it without this write touching the bucket row
+    // that every concurrent call for this user reads. Uncapped buckets (the
+    // shared action/tag rows) get only the usage delta below, which the
+    // reconciler drains.
     const capped = await bucketIsCapped(ctx, t.dimension, t.value);
-    if (capped) {
-      const b = await getBucketDoc(ctx, t.dimension, t.value);
-      if (b) {
-        const targetDay = b.dayStamp > day ? b.dayStamp : day;
-        const targetMonth =
-          (b.monthStamp ?? "") > month ? b.monthStamp! : month;
-        await ctx.db.patch(
-          "buckets",
-          b._id,
-          checkedAccounting(
-            {
-              totalSpendNanos: b.totalSpendNanos + actual,
-              totalRequests: b.totalRequests + 1,
-              totalTokens: b.totalTokens + tokens,
-              ...windowResets(b, targetDay, targetMonth),
-              dayStamp: targetDay,
-              monthStamp: targetMonth,
-              spendTodayNanos:
-                (b.dayStamp === targetDay ? b.spendTodayNanos : 0) +
-                (day === targetDay ? actual : 0),
-              tokensToday:
-                (b.dayStamp === targetDay ? (b.tokensToday ?? 0) : 0) +
-                (day === targetDay ? tokens : 0),
-              spendThisMonthNanos:
-                (b.monthStamp === targetMonth
-                  ? (b.spendThisMonthNanos ?? 0)
-                  : 0) + (month === targetMonth ? actual : 0),
-              tokensThisMonth:
-                (b.monthStamp === targetMonth ? (b.tokensThisMonth ?? 0) : 0) +
-                (month === targetMonth ? tokens : 0),
-              ...(b.dayStamp !== targetDay
-                ? { reservedTodayNanos: 0, reservedTodayTokens: 0 }
-                : {}),
-              ...(b.monthStamp !== targetMonth
-                ? { reservedMonthNanos: 0, reservedMonthTokens: 0 }
-                : {}),
-              // settle hot path: saturate on overflow, never throw (see checkedAccounting)
-            },
-            { saturate: true },
-          ),
-        );
-      }
-    }
+    if (capped && bNow)
+      await addEntry(ctx, bNow._id, {
+        kind: "spend",
+        day,
+        month,
+        nanos: actual,
+        tokens,
+      });
     // Append-only delta: rollupPhase folds it into `usage` (history, all buckets)
     // and, when uncapped, into the bucket-row totals.
     await ctx.db.insert("usageDeltas", {
@@ -1689,6 +1843,7 @@ export const reconcile = internalMutation({
       });
     }
     await ctx.scheduler.runAfter(0, internal.lib.foldPhase, {});
+    await ctx.scheduler.runAfter(0, internal.lib.ledgerPhase, {});
     await ctx.scheduler.runAfter(0, internal.lib.rollupPhase, {});
     await ctx.scheduler.runAfter(0, internal.lib.expirePhase, {});
     await ctx.scheduler.runAfter(0, internal.lib.retentionPhase, {});
@@ -1779,6 +1934,77 @@ export const rollupPhase = internalMutation({
       await ctx.scheduler.runAfter(0, internal.lib.rollupPhase, {});
     }
     return { drained: deltas.length };
+  },
+});
+
+// Apply ledger entries to their bucket rows, in commitTs order, as the only
+// writer of those rows' accounting (admission and settle only insert entries).
+// Reads entries up to this transaction's snapshot, so entries inserted while it
+// runs don't conflict with it. Its bucket patches do conflict with admissions
+// reading those rows at that moment, which Convex retries: about once a minute
+// per active bucket, instead of on every call. Then deletes folded entries
+// older than LEDGER_KEEP_NS, which no admission's read range reaches.
+export const ledgerPhase = internalMutation({
+  args: {},
+  returns: v.object({ folded: v.number(), deleted: v.number() }),
+  handler: async (ctx) => {
+    const snapshotTs = ctx.meta.getSnapshotTs();
+    const state = await ctx.db
+      .query("ledgerState")
+      .withIndex("key", (q) => q.eq("key", "singleton"))
+      .unique();
+    const from = state?.foldedThroughTs ?? 0n;
+    let entries = await ctx.db
+      .query("ledger")
+      .withIndex("ts", (q) => q.gt("ts", from).lte("ts", snapshotTs))
+      .take(LEDGER_FOLD_BATCH);
+    const full = entries.length === LEDGER_FOLD_BATCH;
+    let through = snapshotTs;
+    if (full) {
+      // A batch can end partway through one transaction's entries (they share
+      // a commitTs): fold only up to the last whole timestamp.
+      const last = entries[entries.length - 1].ts as bigint;
+      const whole = entries.filter((e) => (e.ts as bigint) < last);
+      entries = whole.length ? whole : entries;
+      through = whole.length ? (whole[whole.length - 1].ts as bigint) : last;
+    }
+    const byBucket = new Map<Id<"buckets">, LedgerEntry[]>();
+    for (const e of entries) {
+      if (e.kind === "admit") continue;
+      const list = byBucket.get(e.bucketId) ?? [];
+      list.push(e);
+      byBucket.set(e.bucketId, list);
+    }
+    for (const [bucketId, list] of byBucket) {
+      const b = await ctx.db.get("buckets", bucketId);
+      if (!b) continue; // deleted: its entries are swept below
+      const next = replay(b, list);
+      const { _id, _creationTime, ...fields } = next;
+      await ctx.db.replace("buckets", bucketId, {
+        ...fields,
+        foldedThroughTs: through,
+      });
+    }
+    if (state)
+      await ctx.db.patch("ledgerState", state._id, {
+        foldedThroughTs: through,
+      });
+    else
+      await ctx.db.insert("ledgerState", {
+        key: "singleton",
+        foldedThroughTs: through,
+      });
+    const keepFrom = snapshotTs - LEDGER_KEEP_NS;
+    const old = await ctx.db
+      .query("ledger")
+      .withIndex("ts", (q) =>
+        q.lte("ts", through < keepFrom ? through : keepFrom),
+      )
+      .take(LEDGER_FOLD_BATCH);
+    for (const e of old) await ctx.db.delete("ledger", e._id);
+    if (full || old.length === LEDGER_FOLD_BATCH)
+      await ctx.scheduler.runAfter(0, internal.lib.ledgerPhase, {});
+    return { folded: entries.length, deleted: old.length };
   },
 });
 
@@ -2193,9 +2419,10 @@ export const paginateBuckets = query({
             .withIndex("dim_value", (q) => q.eq("dimension", dimension))
             .paginate(options);
     const clock = await getSettings(ctx);
+    const live = await Promise.all(page.page.map((b) => withLedger(ctx, b)));
     return {
       ...page,
-      page: page.page.map((b) =>
+      page: live.map((b) =>
         normalizedBucket(
           b,
           clock?.reportingDay ?? dayStamp(),
@@ -2309,7 +2536,8 @@ export const listBuckets = query({
             .take(ADMIN_LIST_CAP)
         : await ctx.db.query("buckets").take(ADMIN_LIST_CAP);
     const clock = await getSettings(ctx);
-    return rows.map((b) =>
+    const live = await Promise.all(rows.map((b) => withLedger(ctx, b)));
+    return live.map((b) =>
       normalizedBucket(
         b,
         clock?.reportingDay ?? dayStamp(),
@@ -2323,8 +2551,9 @@ export const getBucket = query({
   args: { dimension: v.string(), value: v.string() },
   returns: v.nullable(vNormalizedBucket),
   handler: async (ctx, args) => {
-    const b = await getBucketDoc(ctx, args.dimension, args.value);
-    if (!b) return null;
+    const row = await getBucketDoc(ctx, args.dimension, args.value);
+    if (!row) return null;
+    const b = await withLedger(ctx, row);
     const clock = await getSettings(ctx);
     return normalizedBucket(
       b,
@@ -2760,6 +2989,7 @@ export const setDeploymentPolicy = mutation({
     requireExplicitReservations: v.optional(v.boolean()),
     storeContent: v.optional(v.boolean()),
     storeRawErrors: v.optional(v.boolean()),
+    admission: v.optional(v.union(v.literal("snapshot"), v.literal("exact"))),
   },
   returns: v.null(),
   handler: async (ctx, args) => {
@@ -2772,6 +3002,7 @@ export const setDeploymentPolicy = mutation({
       patch.allowUnpricedModels = args.allowUnpricedModels;
     if ("storeRawErrors" in args) patch.storeRawErrors = args.storeRawErrors;
     if ("storeContent" in args) patch.storeContent = args.storeContent;
+    if ("admission" in args) patch.admission = args.admission;
     const existing = await getSettings(ctx);
     if (existing) await ctx.db.patch("settings", existing._id, patch);
     else await ctx.db.insert("settings", { key: "singleton", ...patch });
@@ -2893,6 +3124,13 @@ async function deleteBucketWork(
   more ||= history.length === DELETE_BATCH;
   const bucket = await getBucketDoc(ctx, dimension, value);
   if (bucket) {
+    const entries = await ctx.db
+      .query("ledger")
+      .withIndex("bucket_ts", (q) => q.eq("bucketId", bucket._id))
+      .take(DELETE_BATCH);
+    // Any entries past this batch are swept by ledgerPhase once the row is gone.
+    for (const e of entries) await ctx.db.delete("ledger", e._id);
+    count += entries.length;
     const policy = await ctx.db
       .query("bucketPolicies")
       .withIndex("dim_value", (q) =>

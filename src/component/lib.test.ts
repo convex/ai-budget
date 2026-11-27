@@ -340,7 +340,7 @@ describe("concurrency cap", () => {
 });
 
 describe("per-bucket rate limits", () => {
-  test("refills continuously and does not consume other buckets on rejection", async () => {
+  test("counts admissions in the last minute and does not consume other buckets on rejection", async () => {
     vi.useFakeTimers();
     try {
       const t = initTest();
@@ -359,14 +359,14 @@ describe("per-bucket rate limits", () => {
       expect(
         (await start(t, { userId: "u", actionName: "free" })).allowed,
       ).toBe(true);
+      vi.advanceTimersByTime(30_000);
       expect(
         (await start(t, { userId: "u", actionName: "free" })).allowed,
       ).toBe(true);
       expect(
         (await start(t, { userId: "u", actionName: "free" })).allowed,
       ).toBe(false);
-      // Slightly past the refill: Date.now() is pinned per mutation and can
-      // run a few ms ahead of the fake clock.
+      // The first admission leaves the window a minute after it was made.
       vi.advanceTimersByTime(31_000);
       expect(
         (await start(t, { userId: "u", actionName: "free" })).allowed,
@@ -379,21 +379,19 @@ describe("per-bucket rate limits", () => {
     }
   });
 
-  test("changing the rate preserves consumption and clamps to capacity", async () => {
+  test("changing the rate keeps the last minute's admissions", async () => {
     vi.useFakeTimers();
     try {
       const t = initTest();
       await setUserLimits(t, "u", { requestsPerMinute: 2 });
       expect((await start(t, { userId: "u" })).allowed).toBe(true);
       expect((await start(t, { userId: "u" })).allowed).toBe(true);
-      await setUserLimits(t, "u", { requestsPerMinute: 4 });
       expect((await start(t, { userId: "u" })).allowed).toBe(false);
-      // Slightly past the refill: Date.now() is pinned per mutation and can
-      // run a few ms ahead of the fake clock.
-      vi.advanceTimersByTime(16_000);
+      await setUserLimits(t, "u", { requestsPerMinute: 3 });
       expect((await start(t, { userId: "u" })).allowed).toBe(true);
-      vi.advanceTimersByTime(60_000);
+      expect((await start(t, { userId: "u" })).allowed).toBe(false);
       await setUserLimits(t, "u", { requestsPerMinute: 1 });
+      vi.advanceTimersByTime(61_000);
       expect((await start(t, { userId: "u" })).allowed).toBe(true);
       expect((await start(t, { userId: "u" })).allowed).toBe(false);
     } finally {
@@ -2024,5 +2022,175 @@ describe("1.1.1 fixes: failure billing, default prices, global enforcement", () 
     });
     const status = await t.query(api.lib.getGlobalStatus, {});
     expect(status.enforcement).toBe("hard");
+  });
+});
+
+describe("ledger: admission and settle never write the bucket row", () => {
+  const rawUser = (t: any, userId: string) =>
+    t.run((ctx: any) =>
+      ctx.db
+        .query("buckets")
+        .withIndex("dim_value", (q: any) =>
+          q.eq("dimension", "user").eq("value", userId),
+        )
+        .unique(),
+    );
+
+  test("reserve and settle are ledger entries; reads replay them; the folder applies them", async () => {
+    const t = initTest();
+    await setUserLimits(t, "u", {
+      dailySpendLimitNanos: 1_000_000_000,
+      maxConcurrent: 5,
+    });
+    const before = await rawUser(t, "u");
+    const a = await start(t, { userId: "u" });
+    const b = await start(t, { userId: "u" });
+    expect(a.allowed && b.allowed).toBe(true);
+    // The row is untouched; getBucket/listBuckets see the holds through the ledger.
+    const row = await rawUser(t, "u");
+    expect(row.pendingCount ?? 0).toBe(0);
+    expect(row.reservedTodayNanos ?? 0).toBe(0);
+    expect(row._creationTime).toBe(before._creationTime);
+    const live = await userOf(t, "u");
+    expect(live.pendingCount).toBe(2);
+    expect(live.reservedTodayNanos).toBeGreaterThan(0);
+
+    await settleWith(t, a.requestId, { costNanos: 300_000_000 });
+    await settleWith(t, b.requestId, { costNanos: 200_000_000 });
+    expect((await rawUser(t, "u")).totalSpendNanos).toBe(0);
+    const settled = await userOf(t, "u");
+    expect(settled.totalSpendNanos).toBe(500_000_000);
+    expect(settled.spendTodayNanos).toBe(500_000_000);
+    expect(settled.pendingCount).toBe(0);
+    expect(settled.reservedTodayNanos).toBe(0);
+    const entries = await t.run((ctx: any) => ctx.db.query("ledger").collect());
+    expect(entries.map((e: any) => e.kind).sort()).toEqual([
+      "release",
+      "release",
+      "reserve",
+      "reserve",
+      "spend",
+      "spend",
+    ]);
+
+    // The folder writes the same totals into the row and marks them folded.
+    await t.mutation(internal.lib.ledgerPhase, {});
+    const folded = await rawUser(t, "u");
+    expect(folded.totalSpendNanos).toBe(500_000_000);
+    expect(folded.spendTodayNanos).toBe(500_000_000);
+    expect(folded.pendingCount).toBe(0);
+    expect(typeof folded.foldedThroughTs).toBe("bigint");
+    // Replaying nothing on top gives the same view, and the cap still counts it.
+    expect((await userOf(t, "u")).totalSpendNanos).toBe(500_000_000);
+  });
+
+  test("a cap counts unfolded holds and spend", async () => {
+    const t = initTest();
+    // Room for one gpt-4o-mini reservation (~480_000 nano), not two.
+    await setUserLimits(t, "u", { dailySpendLimitNanos: 700_000 });
+    const first = await start(t, { userId: "u" });
+    expect(first.allowed).toBe(true);
+    expect((await start(t, { userId: "u" })).code).toBe(
+      "user_daily_spend_limit",
+    );
+    await settleWith(t, first.requestId, { costNanos: 650_000 });
+    // Settled spend, still unfolded, leaves no room for another reservation.
+    expect((await start(t, { userId: "u" })).code).toBe(
+      "user_daily_spend_limit",
+    );
+    await t.mutation(internal.lib.ledgerPhase, {});
+    expect((await start(t, { userId: "u" })).code).toBe(
+      "user_daily_spend_limit",
+    );
+  });
+
+  test("maxConcurrent counts unfolded holds, and folding keeps the count", async () => {
+    const t = initTest();
+    await setUserLimits(t, "u", { maxConcurrent: 2 });
+    const a = await start(t, { userId: "u" });
+    await start(t, { userId: "u" });
+    await t.mutation(internal.lib.ledgerPhase, {});
+    expect((await start(t, { userId: "u" })).code).toBe("user_max_concurrent");
+    await settleWith(t, a.requestId, { costNanos: 1 });
+    expect((await start(t, { userId: "u" })).allowed).toBe(true);
+  });
+
+  test("a hold placed in the row before the ledger is released by a ledger entry", async () => {
+    const t = initTest();
+    await setUserLimits(t, "u", { dailySpendLimitNanos: 1_000_000_000 });
+    const r = await start(t, { userId: "u" });
+    // Simulate the old scheme: the hold lives in the row's counters, with no
+    // ledger entry for it.
+    const est = (
+      await t.run((ctx: any) => ctx.db.get("requests", r.requestId))
+    ).estimatedNanos;
+    await t.run(async (ctx: any) => {
+      for (const e of await ctx.db.query("ledger").collect())
+        await ctx.db.delete("ledger", e._id);
+      const b = await ctx.db
+        .query("buckets")
+        .withIndex("dim_value", (q: any) =>
+          q.eq("dimension", "user").eq("value", "u"),
+        )
+        .unique();
+      await ctx.db.patch("buckets", b._id, {
+        dayStamp: new Date().toISOString().slice(0, 10),
+        monthStamp: new Date().toISOString().slice(0, 7),
+        reservedTodayNanos: est,
+        reservedMonthNanos: est,
+        reservedTotalNanos: est,
+        pendingCount: 1,
+      });
+    });
+    await settleWith(t, r.requestId, { costNanos: 100 });
+    await t.mutation(internal.lib.ledgerPhase, {});
+    const u = await rawUser(t, "u");
+    expect(u.pendingCount).toBe(0);
+    expect(u.reservedTodayNanos).toBe(0);
+    expect(u.reservedTotalNanos).toBe(0);
+    expect(u.totalSpendNanos).toBe(100);
+  });
+
+  test("folded entries are deleted once out of every admission's read range", async () => {
+    vi.useFakeTimers();
+    try {
+      const t = initTest();
+      await setUserLimits(t, "u", { requestsPerMinute: 10 });
+      await start(t, { userId: "u" });
+      await t.mutation(internal.lib.ledgerPhase, {});
+      expect(
+        await t.run((ctx: any) => ctx.db.query("ledger").collect()),
+      ).toHaveLength(1);
+      vi.advanceTimersByTime(3 * 60_000);
+      // A commit moves the snapshot past the keep window (as traffic does).
+      await start(t, { userId: "other" });
+      await t.mutation(internal.lib.ledgerPhase, {});
+      await t.mutation(internal.lib.ledgerPhase, {});
+      expect(
+        await t.run((ctx: any) => ctx.db.query("ledger").collect()),
+      ).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("exact admission mode still admits and settles", async () => {
+    const t = initTest();
+    await t.mutation(api.lib.setDeploymentPolicy, { admission: "exact" });
+    await setUserLimits(t, "u", { dailySpendLimitNanos: 1_000_000_000 });
+    const r = await start(t, { userId: "u" });
+    expect(r.allowed).toBe(true);
+    await settleWith(t, r.requestId, { costNanos: 5 });
+    expect((await userOf(t, "u")).totalSpendNanos).toBe(5);
+  });
+
+  test("deleting a bucket deletes its entries", async () => {
+    const t = initTest();
+    await setUserLimits(t, "u", { dailySpendLimitNanos: 1_000_000_000 });
+    await start(t, { userId: "u" });
+    await t.mutation(api.lib.deleteBucket, { dimension: "user", value: "u" });
+    expect(
+      await t.run((ctx: any) => ctx.db.query("ledger").collect()),
+    ).toHaveLength(0);
   });
 });

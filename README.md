@@ -3,7 +3,7 @@
 **Track, attribute, and cap every user's AI spend.** A metered, budget-governed
 layer over the [Convex AI Gateway](https://docs.convex.dev/ai-gateway/overview).
 Point your LLM calls through it and every request is tracked, priced, attributed,
-and held to a budget — with atomic admission that accounts for concurrent load.
+and held to a budget — with admission that accounts for concurrent load.
 
 > ⚠️ **Best-effort, not a guarantee.** This component *reduces and bounds* AI
 > spend; it does **not** guarantee against all overspend. Per-bucket caps admit on
@@ -57,7 +57,7 @@ audit log. The gateway is the zero-config default, never the only option.
 | **Attribution** | Each call is attributed to a `userId` **and** the Convex action that made it — auto-detected via `ctx.meta`, no manual tagging. |
 | **Tagged budgets** | `user` and `action` are just built-in *dimensions* — add your own (team, project, customer, env…) via `tags`, and cap any of them. One request can be billed to several buckets at once. |
 | **Spend & token limits** | Per-bucket **daily / monthly / lifetime** spend and token budgets, plus requests-per-minute, a max-concurrent cap, and a block switch. |
-| **Concurrency-safe admission** | A reserve-then-settle design makes admission atomic against estimated usage, so concurrent requests can't all spend the same remaining budget. Final usage can exceed its reservation; the actual amount is recorded at settlement. |
+| **Concurrency-safe admission** | A reserve-then-settle design checks each request's estimate against every cap, and concurrent requests for one user never write the same document, so they never conflict. Calls admitted at the same moment can pass a cap by their estimates; `admission: "exact"` closes that gap at the cost of conflicts. Final usage can exceed its reservation; the actual amount is recorded at settlement. |
 | **Hard or soft** | Each limit either **blocks** (`hard`) or **allows-with-a-warning** (`soft`). |
 | **Approaching-limit alerts** | Set `warnAtPct` (e.g. 0.8) and get an `onThreshold` callback before a cap is hit; `onLimitReached` fires when one blocks. |
 | **Spend history** | Durable per-bucket **daily & monthly** rollups that survive request retention — real spend-over-time, per user / action / tag. |
@@ -166,11 +166,10 @@ different dimensions.
 costs, limits, prices. Integers avoid the rounding drift floating-point cents
 accumulate and keep cap comparisons exact (to ~$9M per value). `$1 = 1_000_000_000`.
 
-**Reserve → settle.** Each request is admitted by an atomic check-and-reserve
-of estimated usage against every capped bucket it touches, then settled to its
-real cost when it finishes. That's what prevents concurrent requests from all
-spending the same remaining budget — see
-[How spend caps stay correct](#how-spend-caps-stay-correct).
+**Reserve → settle.** Each request's estimated usage is checked and reserved
+against every capped bucket it touches, then settled to its real cost when it
+finishes. That's what keeps requests from all spending the same remaining
+budget — see [How spend caps stay correct](#how-spend-caps-stay-correct).
 
 > All methods are called from a Convex **action** (they run the gateway call),
 > or a **query** for the read-only ones. `ctx` is the Convex context.
@@ -401,22 +400,21 @@ The identifier field is `userId` for `ai.users`, `name` for `ai.actions`, and
 
 ### Request rate limits
 
-`requestsPerMinute` uses `@convex-dev/rate-limiter` 0.4.0 with a transactional
-**token bucket** for each user, action, or custom tag. A limit of 60 allows an
-initial burst of 60 requests and then refills at one request per second, up to
-60. Zero blocks all requests. Only admitted requests consume capacity: a budget,
-concurrency, or another bucket's rate rejection consumes none.
+`requestsPerMinute` counts each user's, action's, or tag's admissions in the
+last 60 seconds. A limit of 60 allows 60 requests in any minute; each one stops
+counting a minute after it was admitted. Zero blocks all requests. Only
+admitted requests count: a budget, concurrency, or another bucket's rate
+rejection counts toward none.
 
-This replaces the previous rolling 60-second request-log count. On upgrading,
-rate balances start full; historical requests are not imported. Budget balances,
-reservations, and spend history are preserved. Deploy the component update to
-mount its nested Rate Limiter component; applications do not register it separately.
-Changing a rate keeps its existing balance (clamped to the new capacity when
-checked); deleting and recreating a bucket starts a fresh balance.
+The count comes from the same ledger as the spend caps (see
+[Concurrent calls](#concurrent-calls)), so a user's simultaneous calls don't
+conflict over it, and calls admitted at the same moment can pass it by their
+number. A limit above 1,000 per minute, where reading a minute of admissions on
+every call would cost too much, uses `@convex-dev/rate-limiter`'s token bucket
+as before: a burst of the limit, refilling evenly over the minute.
 
-Rate limits remain transactional. Rate Limiter's asynchronous mode is not enabled
-here because simultaneous admissions must respect every configured bucket.
-Global spend accounting continues to use the existing sharded counter.
+On upgrading, rates under 1,000 start from the admissions made after the
+upgrade; earlier token-bucket balances aren't carried over.
 
 ### Setting caps
 
@@ -443,12 +441,13 @@ reserve-then-settle admission check runs per bucket. Uncapped buckets never seri
 adding tags you don't cap is free at admission; their totals still accrue for
 reporting.
 
-> **Choosing what to cap.** A cap makes its bucket's admissions atomic by
-> reserving on that bucket's single row, so capping a dimension that *all* traffic
-> shares (one `env`/`action` every request carries) serializes those admissions on
-> one document under load. Prefer capping **naturally-sharded** dimensions — per
-> `user`, per `customer` — and use the [global cap](#global-cap) for a
-> deployment-wide ceiling. Uncapped high-traffic tags are always free.
+> **Choosing what to cap.** Each admission to a capped bucket reads that
+> bucket's entries since its last fold (about a minute's worth), so capping a
+> dimension that *all* traffic shares (one `env`/`action` every request carries)
+> makes every admission read that dimension's whole last minute. Prefer capping
+> **naturally-sharded** dimensions — per `user`, per `customer` — and use the
+> [global cap](#global-cap) for a deployment-wide ceiling. Uncapped
+> high-traffic tags are always free.
 
 ### Tags — budgeting by any dimension
 
@@ -552,7 +551,7 @@ ai.requests.get(ctx, { requestId })                               // one request
 ai.global.setLimits(ctx, { dailySpendLimitNanos?, lifetimeSpendLimitNanos?, enforcement? })
 ai.global.status(ctx)   // { dailySpendLimitNanos, lifetimeSpendLimitNanos, enforcement, spentTodayNanos, spentTotalNanos, … }
 ai.global.bump(ctx, { dailyNanos?, lifetimeNanos? })
-ai.global.setPolicy(ctx, { allowUnpricedModels?, storeContent?, storeRawErrors?, requireExplicitReservations? })  // deployment data/pricing policy
+ai.global.setPolicy(ctx, { allowUnpricedModels?, storeContent?, storeRawErrors?, requireExplicitReservations?, admission? })  // deployment data/pricing/admission policy
 ```
 
 A best-effort killswitch across everything. Backed by a sharded counter for
@@ -691,12 +690,11 @@ pre-spend total and all pass, so spend blows past the cap (measured at ~40× bef
 this design). `ai-budget` instead **reserves then settles**:
 
 1. **Reserve.** `startRequest` estimates the request's cost/tokens and, *in the
-   same transaction as the limit check*, reserves them against each capped bucket.
-   Under Convex's serializable isolation this is a true atomic check-and-reserve —
-   concurrent requests see each other's holds.
+   same transaction as the limit check*, reserves them against each capped bucket
+   by inserting a ledger entry.
 2. **Settle.** `finishRequest` writes only the request's own (uncontended) row and
-   schedules a fold of the real cost into the totals, releasing the reservation —
-   so a request is never orphaned mid-flight.
+   schedules a fold of the real cost, which inserts the release and the spend as
+   ledger entries — so a request is never orphaned mid-flight.
 3. **Reconcile.** A once-a-minute cron folds any stragglers and releases
    expired reservations using indexed deadlines. Expiry releases the hold but
    leaves billing open: a late completion records its final charge once without
@@ -709,11 +707,44 @@ month boundaries. Admission reads separate policy documents; only capped buckets
 require reads of accounting state. Reporting updates still share bucket totals,
 but do not write the policy documents used by uncapped admission.
 
+### Concurrent calls
+
+One voice turn can make eight metered calls for one user at once: a router, two
+models racing, speech for each sentence. If each call wrote that user's bucket
+row, they would conflict, and under load some would fail every Convex retry.
+So no call writes it. Admission, release and settlement each insert an entry
+into the `ledger` table, stamped with the transaction's commit timestamp
+(`ctx.db.vars.commitTs`). A bucket's row holds its totals through
+`foldedThroughTs`, and the `ledgerPhase` reconciler, the only writer of that
+row's accounting, applies newer entries to it about once a minute.
+
+Admission reads the bucket row and its entries after `foldedThroughTs` up to
+the transaction's snapshot (`ctx.meta.getSnapshotTs()`). Another call's entry
+commits after that snapshot, at a higher timestamp, so it falls outside the
+range this admission read, and the two never conflict. The cost is that
+neither sees the other's hold: calls admitted at the same moment can together
+pass a cap by up to (number of simultaneous calls − 1) × the largest estimate,
+and pass `maxConcurrent` and `requestsPerMinute` by the same count. A call
+admitted after another has committed always sees its hold.
+
+To keep caps to the estimate under concurrency, set
+`ai.global.setPolicy(ctx, { admission: "exact" })`. Admission then also reads
+past its snapshot, so a racing insert conflicts with it and Convex retries it,
+which serializes a bucket's admissions as before this design.
+
+Reads (`getBucket`, `listBuckets`, `ai.users.get`) replay unfolded entries, so
+they show holds and spend as soon as they commit.
+
+**Upgrading.** A bucket's reserved and pending counters from earlier versions
+stay in its row, and a request reserved before the upgrade releases its hold
+with a ledger entry when it settles, so nothing is lost or counted twice.
+Going back to an earlier version needs `foldedThroughTs` removed from every
+bucket row first (after folding its entries), or the old schema won't deploy.
+
 **One admission rule, all scopes.** Every per-bucket cap — user, action, or any
 tag — runs through the *same* admission check: a request is admitted only when
 `committed + reserved + estimate ≤ cap` (bumps included) for **every** bucket it
-touches. Each per-bucket cap reserves on a single document, making concurrent
-admission atomic. The **global** killswitch is backed by a sharded counter for
+touches, up to the bound in [Concurrent calls](#concurrent-calls). The **global** killswitch is backed by a sharded counter for
 throughput. Its sum is transactional but excludes unfinished and not-yet-folded
 requests and has no cross-request reservation, so global admissions can overshoot.
 Global usage is recorded even when limits are disabled. Historical usage omitted
@@ -732,8 +763,8 @@ off shared hot rows:
   compares the total to the cap out-of-band and flags `settings`; admission reads
   one already-loaded doc. The killswitch trips within ~one reconcile interval
   (that's what "approximate" means) instead of contending with every fold.
-- **Settlement doesn't write shared bucket rows.** A capped bucket's row is
-  updated live (it's per-user / low-concurrency, and enforcement needs it); every
+- **Settlement doesn't write bucket rows.** A capped bucket gets ledger entries
+  that admission reads (see [Concurrent calls](#concurrent-calls)); every
   other attributed bucket — the shared `action`/tag rows — gets only an
   append-only delta, which the reconciler drains into totals + history as a single
   writer. So a hot single-dimension settle rate no longer serializes on one row.
